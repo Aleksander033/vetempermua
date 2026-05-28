@@ -1,41 +1,28 @@
 /**
- * sav.js — ONYX Replay Recorder (drop-in)
+ * sav.js — ONYX Replay Recorder (drop-in, fixed)
  * ---------------------------------------------------------------
- * Regjistron vazhdimisht 15 sekondat e fundit të lojës nga <canvas>
- * dhe i ruan si .webm kur shtypet tasti "P" ose thirret API publik.
- *
- * Arkitektura (shkurt):
- *  • captureStream(fps)  → MediaStream nga canvas-i i lojës ONYX.
- *  • MediaRecorder       → kodon në copa (chunks) çdo `timeSliceMs` ms.
- *  • Ring buffer         → mbahen vetëm N copat e fundit (≈15s),
- *                          të vjetrat hidhen → memorie e qëndrueshme.
- *  • saveClip()          → bashkon copat në një Blob webm dhe e shkarkon.
- *  • Auto-recovery       → nëse recorder-i ndalon papritur, ristartohet.
- *  • Cleanup             → pas ruajtjes buffer-i pastrohet (opsion).
- *
- * Si kapen "15 sekondat e fundit":
- *  maxChunks = ceil(bufferLength * 1000 / timeSliceMs).
- *  Çdo `ondataavailable` shton një copë; kur kalon maxChunks → shift().
- *  Pra dritarja rrëshqitëse përmban gjithmonë ≤ bufferLength sekonda.
- *
- * Drop-in: thjesht `<script src="sav.js"></script>` pas ngarkimit të lojës.
- * API global: window.OnyxReplay.{start,stop,save,clear,isRecording}
+ * Rregullim kryesor vs versionit të vjetër:
+ *  • Mban "header chunk" (copën e parë me init segment të WebM)
+ *    dhe e prepend-on në çdo save → videoja luhet GJITHMONË, jo vetëm herën e parë.
+ *  • Pas save, recorder-i ristartohet pastër që header-i të rigjenerohet.
+ *  • Cleanup i plotë i MediaStream + MediaRecorder, pa memory leak.
+ *  • Mbrojtje nga thirrjet e dyfishta (save në vazhdim).
  * ---------------------------------------------------------------
  */
 (() => {
   'use strict';
 
-  // -------- Konfigurimi default (mund të mbishkruhet me window.ONYX_REPLAY_CONFIG) --------
   const CFG = Object.assign({
-    bufferLength: 15,        // sekonda të mbajtura në buffer
-    timeSliceMs: 1000,       // sa shpesh të prodhohen copat
-    fps: 30,                 // frame rate i kapur nga canvas
-    hotkey: 'p',             // tasti i shpejtë i ruajtjes
-    audio: false,            // përfshi audion e tabit (nëse mundet)
-    autoClearOnSave: false,  // pastro buffer-in pas ruajtjes
-    filenamePrefix: 'Onyx',  // prefiks për emrin e file-it
-    canvasSelector: null,    // p.sh. '#canvas' (auto-detect nëse null)
-    maxBlobBytes: 80 * 1024 * 1024, // limit mbrojtës ndaj rritjes pa kontroll
+    bufferLength: 15,
+    timeSliceMs: 1000,
+    fps: 30,
+    hotkey: 'p',
+    audio: false,
+    autoClearOnSave: false,
+    filenamePrefix: 'Onyx',
+    canvasSelector: null,
+    maxBlobBytes: 80 * 1024 * 1024,
+    restartAfterSave: true, // ristarto recorder pas save për header të ri
     debug: true,
   }, (typeof window !== 'undefined' && window.ONYX_REPLAY_CONFIG) || {});
 
@@ -43,125 +30,147 @@
   const warn = (...a) => console.warn('[OnyxReplay]', ...a);
   const err  = (...a) => console.error('[OnyxReplay]', ...a);
 
-  // -------- Përzgjedhja e mimeType më të mirë në dispozicion --------
-  const pickMime = () => {
+  const MIME_CANDIDATES = [
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp9',
+    'video/webm;codecs=vp8,opus',
+    'video/webm;codecs=vp8',
+    'video/webm',
+    'video/mp4;codecs=h264,aac',
+    'video/mp4',
+  ];
+
+  function pickMimeType() {
     if (typeof MediaRecorder === 'undefined') return null;
-    const candidates = [
-      'video/webm;codecs=vp9,opus',
-      'video/webm;codecs=vp9',
-      'video/webm;codecs=vp8,opus',
-      'video/webm;codecs=vp8',
-      'video/webm',
-      'video/mp4',
-    ];
-    return candidates.find(t => MediaRecorder.isTypeSupported(t)) || null;
-  };
+    for (const t of MIME_CANDIDATES) {
+      try { if (MediaRecorder.isTypeSupported(t)) return t; } catch (_) {}
+    }
+    return '';
+  }
+
+  function findCanvas(selector) {
+    if (selector) {
+      const el = document.querySelector(selector);
+      if (el instanceof HTMLCanvasElement) return el;
+    }
+    const all = Array.from(document.querySelectorAll('canvas'));
+    if (!all.length) return null;
+    // canvas-i më i madh në viewport (zakonisht ai i lojës)
+    return all.sort((a, b) => (b.width * b.height) - (a.width * a.height))[0];
+  }
 
   class ReplayRecorder {
-    constructor(opts = {}) {
-      this.cfg = Object.assign({}, CFG, opts);
-      this.maxChunks = Math.max(2, Math.ceil((this.cfg.bufferLength * 1000) / this.cfg.timeSliceMs) + 1);
-      this.chunks = [];
-      this.bytes = 0;
+    constructor(cfg = CFG) {
+      this.cfg = cfg;
       this.canvas = null;
       this.stream = null;
       this.recorder = null;
+      this._mimeType = null;
+      this.chunks = [];
+      this.headerChunk = null;   // PIN: copa e parë me header
+      this.totalBytes = 0;
       this.isRecording = false;
+      this._wantRunning = false;
       this._restartTimer = null;
-      this._boundVisibility = this._onVisibility.bind(this);
+      this._saving = false;
+      this.maxChunks = Math.max(1, Math.ceil((cfg.bufferLength * 1000) / cfg.timeSliceMs));
     }
 
-    /** Gjen canvas-in e ONYX (ose përdor selektorin e dhënë). */
-    _resolveCanvas(canvasOrEl) {
-      if (canvasOrEl instanceof HTMLCanvasElement) return canvasOrEl;
-      if (this.cfg.canvasSelector) {
-        const el = document.querySelector(this.cfg.canvasSelector);
-        if (el instanceof HTMLCanvasElement) return el;
-      }
-      // Heuristikë: ID-të e zakonshme ONYX/agar, pastaj canvas-i më i madh.
-      const byId = document.getElementById('canvas')
-                || document.getElementById('game-canvas')
-                || document.getElementById('gameCanvas');
-      if (byId instanceof HTMLCanvasElement) return byId;
-      const all = Array.from(document.querySelectorAll('canvas'));
-      if (!all.length) return null;
-      return all.sort((a, b) => (b.width * b.height) - (a.width * a.height))[0];
-    }
-
-    /** Nis regjistrimin në buffer. */
     start(canvasOrEl) {
       if (this.isRecording) return true;
-      if (typeof MediaRecorder === 'undefined') {
-        err('MediaRecorder nuk mbështetet nga ky browser.');
-        return false;
-      }
-      const canvas = this._resolveCanvas(canvasOrEl);
-      if (!canvas || typeof canvas.captureStream !== 'function') {
-        warn('Canvas nuk u gjet ende — do të riprovohet.');
-        return false;
-      }
+
+      const canvas = (canvasOrEl instanceof HTMLCanvasElement)
+        ? canvasOrEl
+        : findCanvas(this.cfg.canvasSelector);
+      if (!canvas) { warn('Canvas s’u gjet ende.'); return false; }
+      if (typeof MediaRecorder === 'undefined') { err('MediaRecorder s’suportohet.'); return false; }
+
+      this._cleanupStream(); // siguri shtesë
 
       try {
         this.canvas = canvas;
-        this.stream = canvas.captureStream(this.cfg.fps);
+        const stream = canvas.captureStream(this.cfg.fps);
 
-        // Audio opsionale (mute fail → vazhdo pa audio).
         if (this.cfg.audio) {
           try {
-            const ctxAudio = window.__onyxAudioStream;
-            if (ctxAudio && ctxAudio.getAudioTracks) {
-              ctxAudio.getAudioTracks().forEach(t => this.stream.addTrack(t));
-            }
-          } catch (_) { /* injorohet */ }
+            const ac = new (window.AudioContext || window.webkitAudioContext)();
+            const dest = ac.createMediaStreamDestination();
+            dest.stream.getAudioTracks().forEach(t => stream.addTrack(t));
+          } catch (e) { warn('Audio s’u shtua:', e); }
         }
 
-        const mimeType = pickMime();
-        if (!mimeType) { err('Asnjë mimeType i mbështetur.'); return false; }
+        this.stream = stream;
+        this._mimeType = pickMimeType();
+        const opts = this._mimeType ? { mimeType: this._mimeType } : {};
+        this.recorder = new MediaRecorder(stream, opts);
 
-        this.recorder = new MediaRecorder(this.stream, {
-          mimeType,
-          videoBitsPerSecond: 2_500_000, // ~2.5 Mbps – balancë cilësi/madhësi
-        });
-        this._mimeType = mimeType;
+        this.recorder.ondataavailable = (e) => {
+          if (!e.data || !e.data.size) return;
+          // copa e parë = header / init segment → pin
+          if (!this.headerChunk) {
+            this.headerChunk = e.data;
+            log('Header chunk u ruajt (', e.data.size, 'bytes )');
+            return;
+          }
+          this.chunks.push(e.data);
+          this.totalBytes += e.data.size;
 
-        this.recorder.ondataavailable = (e) => this._onData(e);
-        this.recorder.onerror = (e) => err('MediaRecorder error', e.error || e);
-        this.recorder.onstop = () => {
-          // Ristart automatik nëse nuk është ndalim i kërkuar nga përdoruesi.
-          if (this._wantRunning) this._scheduleRestart(250);
+          while (this.chunks.length > this.maxChunks) {
+            const removed = this.chunks.shift();
+            this.totalBytes -= removed.size || 0;
+          }
+          while (this.totalBytes > this.cfg.maxBlobBytes && this.chunks.length > 1) {
+            const removed = this.chunks.shift();
+            this.totalBytes -= removed.size || 0;
+          }
         };
 
-        this.chunks = [];
-        this.bytes = 0;
-        this._wantRunning = true;
+        this.recorder.onerror = (ev) => {
+          err('Recorder error:', ev?.error || ev);
+          this._scheduleRestart(500);
+        };
+
+        this.recorder.onstop = () => {
+          this.isRecording = false;
+          if (this._wantRunning) this._scheduleRestart(150);
+        };
+
         this.recorder.start(this.cfg.timeSliceMs);
         this.isRecording = true;
-
-        document.addEventListener('visibilitychange', this._boundVisibility);
-        log(`Buffer ${this.cfg.bufferLength}s aktiv (${mimeType}, ${this.cfg.fps}fps).`);
+        this._wantRunning = true;
+        log('Filloi regjistrimi (', this._mimeType || 'default', ')');
         return true;
       } catch (e) {
-        err('Dështoi nisja:', e);
+        err('Start dështoi:', e);
         this._cleanupStream();
         return false;
       }
     }
 
-    _onData(event) {
-      const data = event && event.data;
-      if (!data || !data.size) return;
-      this.chunks.push(data);
-      this.bytes += data.size;
+    stop() {
+      this._wantRunning = false;
+      if (this._restartTimer) { clearTimeout(this._restartTimer); this._restartTimer = null; }
+      this._cleanupStream();
+      this.isRecording = false;
+    }
 
-      // Ring buffer: heq copat më të vjetra për të mbajtur dritaren ≈15s.
-      while (this.chunks.length > this.maxChunks) {
-        const dropped = this.chunks.shift();
-        this.bytes -= dropped.size || 0;
+    clear() {
+      this.chunks = [];
+      this.totalBytes = 0;
+      // headerChunk MBETET — i nevojshëm për luajtjen
+    }
+
+    _cleanupStream() {
+      if (this.recorder) {
+        try { if (this.recorder.state !== 'inactive') this.recorder.stop(); } catch (_) {}
+        this.recorder.ondataavailable = null;
+        this.recorder.onerror = null;
+        this.recorder.onstop = null;
+        this.recorder = null;
       }
-      // Mbrojtje shtesë kundër rritjes së memories.
-      while (this.bytes > this.cfg.maxBlobBytes && this.chunks.length > 1) {
-        const dropped = this.chunks.shift();
-        this.bytes -= dropped.size || 0;
+      if (this.stream) {
+        try { this.stream.getTracks().forEach(t => t.stop()); } catch (_) {}
+        this.stream = null;
       }
     }
 
@@ -169,74 +178,80 @@
       if (this._restartTimer) return;
       this._restartTimer = setTimeout(() => {
         this._restartTimer = null;
-        this.isRecording = false;
-        this._cleanupStream();
-        if (this._wantRunning) this.start(this.canvas);
+        if (!this._wantRunning) return;
+        // header i vjetër s’përputhet me stream të ri → reset
+        this.headerChunk = null;
+        this.chunks = [];
+        this.totalBytes = 0;
+        const ok = this.start(this.canvas);
+        if (!ok) this._scheduleRestart(1000);
       }, delay);
     }
 
-    _onVisibility() {
-      // Disa browser-a ndalojnë captureStream kur tab-i është i fshehur.
-      if (!document.hidden && this._wantRunning && !this.isRecording) {
-        this._scheduleRestart(100);
-      }
-    }
-
-    _cleanupStream() {
-      try { this.recorder && this.recorder.state !== 'inactive' && this.recorder.stop(); } catch (_) {}
-      try { this.stream && this.stream.getTracks().forEach(t => t.stop()); } catch (_) {}
-      this.recorder = null;
-      this.stream = null;
-    }
-
-    /** Ndalon plotësisht regjistrimin (pa ruajtur). */
-    stop() {
-      this._wantRunning = false;
-      document.removeEventListener('visibilitychange', this._boundVisibility);
-      this._cleanupStream();
-      this.isRecording = false;
-      log('U ndal.');
-    }
-
-    /** Pastron buffer-in pa ndalur regjistrimin. */
-    clear() {
-      this.chunks = [];
-      this.bytes = 0;
-    }
-
-    /** Ruan 15 sekondat e fundit si .webm. */
     async save(filename) {
-      if (!this.chunks.length) { warn('Buffer bosh — prit pak.'); return null; }
-
-      // Kërko një copë të freskët para se të bashkojmë (më pak humbje).
-      try {
-        if (this.recorder && this.recorder.state === 'recording' && this.recorder.requestData) {
-          this.recorder.requestData();
-          await new Promise(r => setTimeout(r, 80));
-        }
-      } catch (_) { /* injorohet */ }
-
-      const type = (this._mimeType || 'video/webm').split(';')[0];
-      const blob = new Blob(this.chunks.slice(), { type });
-      const url = URL.createObjectURL(blob);
-      const name = filename || this._defaultName(type);
-
-      try {
-        const a = document.createElement('a');
-        a.style.display = 'none';
-        a.href = url;
-        a.download = name;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-      } finally {
-        // Çlirim memorie i sigurt edhe nëse shkarkimi dështon.
-        setTimeout(() => URL.revokeObjectURL(url), 1500);
+      if (this._saving) { warn('Save në vazhdim…'); return null; }
+      if (!this.headerChunk && !this.chunks.length) {
+        warn('Buffer bosh — prit pak sekonda.');
+        return null;
       }
 
-      log(`U ruajt: ${name} (${(blob.size / 1024 / 1024).toFixed(2)} MB)`);
-      if (this.cfg.autoClearOnSave) this.clear();
-      return blob;
+      this._saving = true;
+      try {
+        // kërko copën e fundit që buffer-i të jetë sa më i ri
+        if (this.recorder && this.recorder.state === 'recording') {
+          try { this.recorder.requestData(); } catch (_) {}
+          await new Promise(r => setTimeout(r, 200));
+        }
+
+        const type = (this._mimeType || 'video/webm').split(';')[0];
+        const parts = [];
+        if (this.headerChunk) parts.push(this.headerChunk);
+        parts.push(...this.chunks);
+
+        const blob = new Blob(parts, { type });
+        if (!blob.size) { warn('Blob bosh.'); return null; }
+
+        const url = URL.createObjectURL(blob);
+        const name = filename || this._defaultName(type);
+
+        try {
+          const a = document.createElement('a');
+          a.style.display = 'none';
+          a.href = url;
+          a.download = name;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+        } catch (e) {
+          warn('Download dështoi, hap në tab:', e);
+          window.open(url, '_blank');
+        } finally {
+          setTimeout(() => { try { URL.revokeObjectURL(url); } catch (_) {} }, 4000);
+        }
+
+        log(`U ruajt: ${name} (${(blob.size / 1024 / 1024).toFixed(2)} MB)`);
+
+        if (this.cfg.autoClearOnSave) this.clear();
+
+        // ristarto recorder-in → header i ri për save-t e ardhshëm
+        if (this.cfg.restartAfterSave && this._wantRunning) {
+          log('Ristartim i recorder-it pas save…');
+          this._cleanupStream();
+          this.headerChunk = null;
+          this.chunks = [];
+          this.totalBytes = 0;
+          this.isRecording = false;
+          // jep 1 tick që browser-i të lirojë burimet
+          setTimeout(() => { if (this._wantRunning) this.start(this.canvas); }, 100);
+        }
+
+        return blob;
+      } catch (e) {
+        err('Save error:', e);
+        return null;
+      } finally {
+        this._saving = false;
+      }
     }
 
     _defaultName(type) {
@@ -246,19 +261,17 @@
     }
   }
 
-  // -------- Inicializimi automatik kur canvas-i është gati --------
   const recorder = new ReplayRecorder();
 
   const tryStart = (attemptsLeft = 30) => {
     if (recorder.start()) return;
-    if (attemptsLeft <= 0) { warn('Nuk u gjet canvas pas shumë provave.'); return; }
+    if (attemptsLeft <= 0) { warn('Canvas s’u gjet pas shumë provave.'); return; }
     setTimeout(() => tryStart(attemptsLeft - 1), 1000);
   };
 
   const boot = () => {
     tryStart();
 
-    // Hotkey: P (pa qenë në input/chat).
     window.addEventListener('keydown', (e) => {
       if (!e.key || e.key.toLowerCase() !== CFG.hotkey) return;
       const ae = document.activeElement;
@@ -271,7 +284,6 @@
       recorder.save();
     }, { passive: false });
 
-    // Trigger opsional për kill/death (nëse loja emit-on evente).
     const onClipEvent = (ev) => {
       const tag = (ev && ev.detail && ev.detail.type) || 'event';
       recorder.save(`${CFG.filenamePrefix}-${tag}-${Date.now()}.webm`);
@@ -280,23 +292,19 @@
     window.addEventListener('onyx:death', onClipEvent);
     window.addEventListener('onyx:clip',  onClipEvent);
 
-    // Pastrim para mbylljes së faqes (evitim memory-leak).
     window.addEventListener('pagehide', () => recorder.stop(), { once: true });
   };
 
-  if (document.readyState === 'complete' || document.readyState === 'interactive') {
-    boot();
-  } else {
-    window.addEventListener('DOMContentLoaded', boot, { once: true });
-  }
+  if (document.readyState === 'complete' || document.readyState === 'interactive') boot();
+  else window.addEventListener('DOMContentLoaded', boot, { once: true });
 
-  // -------- API global --------
   window.OnyxReplay = {
     start:  (el) => recorder.start(el),
-    stop:   ()    => recorder.stop(),
-    save:   (n)   => recorder.save(n),
-    clear:  ()    => recorder.clear(),
+    stop:   ()   => recorder.stop(),
+    save:   (n)  => recorder.save(n),
+    clear:  ()   => recorder.clear(),
     get isRecording() { return recorder.isRecording; },
     _instance: recorder,
   };
 })();
+
