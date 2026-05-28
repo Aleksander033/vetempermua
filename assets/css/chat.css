@@ -1,0 +1,57 @@
+/* Stilizimi i chat-it bazuar në parametrat e "bundle.js" */
+#chat-container {
+    position: fixed;
+    bottom: 20px;
+    left: 20px;
+    width: 350px;
+    height: 250px;
+    background: rgba(0, 0, 0, 0.5); /* cellsTransparency nga settings */
+    border-radius: 5px;
+    display: flex;
+    flex-direction: column;
+    font-family: 'Ubuntu', sans-serif;
+    pointer-events: none; /* Lejon klikimin përmes kutisë kur nuk shkruajmë */
+    z-index: 1000;
+}
+
+#chat-messages {
+    flex: 1;
+    overflow-y: hidden; /* Origjinali fsheh scrollbar-in */
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+}
+
+.chat-line {
+    font-size: 14px;
+    margin-bottom: 4px;
+    text-shadow: 1px 1px 1px #000;
+    word-wrap: break-word;
+}
+
+.chat-nick {
+    font-weight: bold;
+    color: #4fecff; /* chatNickColor nga settings */
+    margin-right: 5px;
+}
+
+.chat-msg {
+    color: #DDDDDD; /* chatMessageColor nga settings */
+}
+
+#chat-input-wrapper {
+    padding: 10px;
+    background: rgba(0, 0, 0, 0.3);
+}
+
+#chat-input {
+    width: 100%;
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid #fff;
+    color: white;
+    outline: none;
+    pointer-events: auto; /* Lejon klikimin për të shkruar */
+    display: none; /* Fshihet deri sa të shtypet Enter */
+}
